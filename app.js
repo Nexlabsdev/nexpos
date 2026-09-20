@@ -1,0 +1,2155 @@
+/* ==========================================================================
+   NEXPOS COFFEE STUDIO — COMPLETE ENGINE
+   ========================================================================== */
+
+const INITIAL_SEED = {
+    products: [],
+    categories: ["Coffee", "Non Coffee", "Tea", "Manual Brew", "Snack"],
+    ingredients: [],
+    recipes: {},
+    customers: [],
+    transactions: [],
+    expenses: [],
+    beans: ["Arabika Gayo", "Toraja Kalosi", "Ethiopia Yirgacheffe", "Robusta Lampung", "Flores Bajawa"],
+    holdCarts: [],
+    settings: {
+        cafeName: "NexPOS Coffee",
+        address: "Jl. Kopi Studio No. 1",
+        phone: "08123456789",
+        taxRate: 10,
+        receiptFooter: "Terima kasih atas kunjungan Anda!",
+        bankName: "BCA",
+        bankNo: "1234567890",
+        bankHolder: "Kopi Studio",
+        qrisImage: null,
+        logoImage: null,
+        markupGofood: 20,
+        markupGrabfood: 20,
+        markupShopeefood: 20,
+        extraShotPrice: 5000,
+        customOptionPrices: { lessSugar: 0, noSugar: 0, lessIce: 0, noIce: 0, hot: 0 },
+        deleteTransactionPin: '1234'
+    }
+};
+
+const Storage = {
+    cache: {},
+    ready: false,
+    connected: false,
+    syncQueue: new Map(),
+    keys: ['products', 'categories', 'ingredients', 'recipes', 'customers', 'transactions', 'expenses', 'beans', 'holdCarts', 'settings'],
+    get(key) {
+        return Object.prototype.hasOwnProperty.call(this.cache, key) ? this.cache[key] : null;
+    },
+    set(key, val) {
+        this.cache[key] = val;
+        if (this.ready) localStorage.setItem('nexpos_' + key, JSON.stringify(val));
+        return this.persist(key, val);
+    },
+    async persist(key, val) {
+        if (!this.connected || !navigator.onLine) {
+            this.syncQueue.set(key, val);
+            return;
+        }
+        try {
+            const response = await fetch(`/api/data/${encodeURIComponent(key)}`, {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: val })
+            });
+            if (!response.ok) throw new Error('Penyimpanan SQLite gagal');
+        } catch (error) {
+            this.connected = false;
+            this.syncQueue.set(key, val);
+            console.warn('SQLite tidak tersedia; data disimpan sementara di perangkat.', error);
+        }
+    },
+    async flushQueue() {
+        if (!this.connected || !this.syncQueue.size) return;
+        const queued = [...this.syncQueue.entries()];
+        this.syncQueue.clear();
+        for (const [key, value] of queued) await this.persist(key, value);
+    },
+    async init() {
+        for (const key of this.keys) {
+            const saved = localStorage.getItem('nexpos_' + key);
+            try { this.cache[key] = saved ? JSON.parse(saved) : structuredClone(INITIAL_SEED[key]); }
+            catch { this.cache[key] = structuredClone(INITIAL_SEED[key]); }
+        }
+        try {
+            const response = await fetch('/api/data', { cache: 'no-store' });
+            if (!response.ok) throw new Error('SQLite API tidak tersedia');
+            const remote = (await response.json()).data || {};
+            this.connected = true;
+            for (const key of this.keys) {
+                // On first migration, do not let an empty server collection overwrite
+                // meaningful data that already exists in this browser.
+                const localHasData = Array.isArray(this.cache[key]) && this.cache[key].length > 0;
+                const remoteIsEmptyList = Array.isArray(remote[key]) && remote[key].length === 0;
+                if (Object.prototype.hasOwnProperty.call(remote, key) && !(localHasData && remoteIsEmptyList)) {
+                    this.cache[key] = remote[key];
+                    localStorage.setItem('nexpos_' + key, JSON.stringify(remote[key]));
+                } else {
+                    await this.persist(key, this.cache[key]);
+                }
+            }
+            window.addEventListener('online', () => { this.connected = true; this.flushQueue(); });
+        } catch (error) {
+            this.connected = false;
+            console.warn('Mode offline: SQLite belum dapat dijangkau.', error);
+        }
+        this.ready = true;
+        const today = dayKey();
+        const lastOpen = localStorage.getItem('nexpos_business_date');
+        const hasPending = (this.get('transactions') || []).length > 0 || (this.get('expenses') || []).length > 0;
+        if (!lastOpen) localStorage.setItem('nexpos_business_date', today);
+        else if (lastOpen !== today && hasPending) showMandatoryCloseDay(lastOpen);
+        else if (lastOpen !== today) localStorage.setItem('nexpos_business_date', today);
+    },
+    async resetToDefault() {
+        const settings = this.get('settings') || INITIAL_SEED.settings;
+        openAppPrompt('Verifikasi Reset Data', 'Masukkan PIN untuk reset semua data:', '', pin => {
+            if (pin !== settings.deleteTransactionPin) return showToast('PIN reset salah.');
+            openAppConfirm('Reset Semua Data?', 'Semua data operasional akan dikembalikan ke kondisi awal. Data login tetap aman.', async () => {
+                for (const key of this.keys) await this.set(key, structuredClone(INITIAL_SEED[key]));
+                location.reload();
+            });
+        });
+    }
+};
+
+function dayKey(date = new Date()) { return date.toISOString().slice(0, 10); }
+const Auth = {
+    async check() {
+        const response = await fetch('/api/auth/me', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Autentikasi lokal tidak tersedia');
+        const { user } = await response.json();
+        document.getElementById('login-overlay').classList.toggle('active', !user);
+        return user;
+    },
+    async handleLogin(e) {
+        e.preventDefault();
+        const u = document.getElementById('login-u').value;
+        const p = document.getElementById('login-p').value;
+        try {
+            const response = await fetch('/api/auth/login', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: u, password: p })
+            });
+            if (!response.ok) throw new Error('Login gagal');
+            document.getElementById('login-overlay').classList.remove('active');
+            await Storage.init();
+            showToast('Selamat Datang Admin Studio');
+            renderDashboard();
+        } catch (error) {
+            showToast('Email atau password salah.');
+        }
+    },
+    logout() {
+        fetch('/api/auth/logout', { method: 'POST' }).finally(() => location.reload());
+    },
+    async changeCredentials(event) {
+        event.preventDefault();
+        const email = document.getElementById('account-email').value;
+        const currentPassword = document.getElementById('account-current-password').value;
+        const newPassword = document.getElementById('account-new-password').value;
+        try {
+            const response = await fetch('/api/auth/account', {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, currentPassword, newPassword })
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || 'Akun gagal diperbarui');
+            document.getElementById('account-current-password').value = '';
+            document.getElementById('account-new-password').value = '';
+            showToast('Email dan password berhasil diperbarui.');
+        } catch (error) {
+            showToast(error.message || 'Akun gagal diperbarui.');
+        }
+    }
+};
+
+let currentCustomProduct = null;
+let customState = { size: { val: 'Regular', extra: 0 }, sugar: { val: 'Normal', extra: 0 }, ice: { val: 'Normal', extra: 0 }, bean: null, extras: [], notes: '', qty: 1 };
+let discountState = { type: 'NOMINAL', val: 0 };
+let currentOrderType = 'DINE_IN';
+let currentPayMethod = 'CASH';
+let memberSearchResults = [];
+let isMemberMode = false;
+let tempQrisImage = null;
+let tempLogoImage = null;
+let pendingDeleteBeanIndex = null;
+let editingBeanIndex = null;
+let pendingDeleteProductId = null;
+let editingRecipeProductId = null;
+let appPromptAction = null;
+let appConfirmAction = null;
+let connectedPrinterPort = null;
+
+const POS = {
+    cart: [],
+    selectedCategory: 'Semua',
+
+    init() {
+        this.renderCategories();
+        this.renderProducts();
+        this.renderCart();
+        this.updateHoldCount();
+    },
+
+    renderCategories() {
+        const rawCats = Storage.get('categories') || [];
+        const cats = ['Semua', ...rawCats.map(c => typeof c === 'object' ? c.name : c)];
+        document.getElementById('pos-categories').innerHTML = cats.map(c => `
+            <div class="chip ${c === this.selectedCategory ? 'active' : ''}" onclick="POS.selectCategory('${c}')">${c}</div>
+        `).join('');
+    },
+
+    selectCategory(cat) {
+        this.selectedCategory = cat;
+        this.renderCategories();
+        this.renderProducts();
+    },
+
+    renderProducts() {
+        const search = document.getElementById('pos-search').value.toLowerCase();
+        const products = Storage.get('products') || [];
+
+        const filtered = products.filter(p => {
+            const matchesCat = this.selectedCategory === 'Semua' || p.category === this.selectedCategory;
+            const matchesSearch = p.name.toLowerCase().includes(search);
+            return matchesCat && matchesSearch && p.status === 'ACTIVE';
+        });
+
+        const grid = document.getElementById('pos-products');
+        if (filtered.length === 0) {
+            grid.innerHTML = `<p class="text-muted" style="grid-column:1/-1; text-align:center; padding:2rem;">Menu tidak ditemukan</p>`;
+            return;
+        }
+
+        grid.innerHTML = filtered.map(p => `
+            <div class="product-card" onclick="POS.handleProductClick('${p.id}')">
+                <div>
+                    <div class="product-name">${p.name}</div>
+                    <div class="product-cat">${p.category}</div>
+                </div>
+                <div class="product-price">Rp${p.price.toLocaleString('id-ID')}</div>
+            </div>
+        `).join('');
+    },
+
+    handleProductClick(id) {
+        playBeepSound();
+        const p = Storage.get('products').find(item => item.id === id);
+        if (!p) return;
+
+        const categoryValue = typeof p.category === 'object' && p.category ? p.category.name : p.category;
+        const categoryName = String(categoryValue || '').toLowerCase().trim();
+        const isDrink = ['coffee', 'coffe', 'non coffee', 'tea', 'manual brew', 'espresso', 'espresso based', 'coffee based']
+            .some(category => categoryName === category || categoryName.includes(category));
+        if (isDrink) {
+            this.openCustomModal(p);
+        } else {
+            this.addToCart({ id: p.id, name: p.name, price: p.price, customStr: '', qty: 1 });
+        }
+    },
+
+    openCustomModal(product) {
+        currentCustomProduct = product;
+        const beans = Storage.get('beans') || [];
+        const categoryValue = typeof product.category === 'object' && product.category ? product.category.name : product.category;
+        const isManualBrew = String(categoryValue || '').toLowerCase().trim().includes('manual brew');
+        const firstBean = beans[0];
+
+        customState = {
+            size: { val: 'Regular', extra: 0 },
+            sugar: { val: 'Normal', extra: 0 },
+            ice: { val: 'Normal', extra: 0 },
+            bean: (isManualBrew && beans.length > 0) ? this.getBeanInfo(firstBean) : null,
+            extras: [],
+            notes: '',
+            qty: 1
+        };
+
+        document.getElementById('custom-title').innerText = product.name;
+        document.getElementById('custom-base-price').innerText = `Harga Dasar: Rp${product.price.toLocaleString('id-ID')}`;
+        document.getElementById('custom-notes').value = '';
+        document.getElementById('custom-qty-val').innerText = '1';
+
+        const beanSection = document.getElementById('manual-brew-bean-section');
+        if (isManualBrew) {
+            beanSection.style.display = 'block';
+            this.renderBeanOptions();
+        } else {
+            beanSection.style.display = 'none';
+        }
+
+        document.querySelectorAll('#modal-custom-drink .opt-btn').forEach(btn => btn.classList.remove('active'));
+        const extraShotButton = document.getElementById('custom-extra-shot-btn');
+        if (extraShotButton) extraShotButton.innerText = `Extra Shot (+Rp${getExtraShotPrice().toLocaleString('id-ID')})`;
+        refreshCustomOptionLabels();
+        document.querySelector('#opt-size .opt-btn')?.classList.add('active');
+        document.querySelectorAll('#opt-sugar .opt-btn')[0].classList.add('active');
+        document.querySelectorAll('#opt-ice .opt-btn')[0].classList.add('active');
+
+        this.updateCustomPrice();
+        openModal('modal-custom-drink');
+    },
+
+    renderBeanOptions() {
+        const beans = Storage.get('beans') || [];
+        document.getElementById('opt-beans').innerHTML = beans.map((b, idx) => `
+            <button class="opt-btn ${idx === 0 ? 'active' : ''}" onclick="setBeanOpt('${String(this.getBeanInfo(b).name).replace(/'/g, "\\'")}', this)">${this.getBeanInfo(b).name} <small>(+Rp${this.getBeanInfo(b).extraPrice.toLocaleString('id-ID')})</small></button>
+        `).join('');
+    },
+
+    getBeanInfo(bean) {
+        if (typeof bean === 'object' && bean) return { name: bean.name, extraPrice: Number(bean.extraPrice) || 0 };
+        return { name: bean || '', extraPrice: 0 };
+    },
+
+    updateCustomPrice() {
+        if (!currentCustomProduct) return;
+        const beanExtra = customState.bean ? customState.bean.extraPrice : 0;
+        let total = currentCustomProduct.price + beanExtra + customState.size.extra + customState.sugar.extra + customState.ice.extra;
+        customState.extras.forEach(e => total += e.extra);
+        total *= customState.qty;
+        document.getElementById('custom-total-price').innerText = `Rp${total.toLocaleString('id-ID')}`;
+    },
+
+    saveCustomToCart(goToPayment = false) {
+        let details = [customState.size.val, customState.sugar.val, customState.ice.val];
+        if (customState.extras.length > 0) details.push(customState.extras.map(e => e.val).join(', '));
+
+        const notes = document.getElementById('custom-notes').value.trim();
+        if (notes) details.push(`Note: ${notes}`);
+
+        const beanExtra = customState.bean ? customState.bean.extraPrice : 0;
+        let unitPrice = currentCustomProduct.price + beanExtra + customState.size.extra + customState.sugar.extra + customState.ice.extra;
+        customState.extras.forEach(e => unitPrice += e.extra);
+
+        this.addToCart({
+            id: currentCustomProduct.id,
+            name: currentCustomProduct.name,
+            beanName: customState.bean ? customState.bean.name : '',
+            price: unitPrice,
+            customStr: details.join(' • '),
+            qty: customState.qty
+        });
+
+        closeModal('modal-custom-drink');
+        if (goToPayment) this.openCheckout();
+    },
+
+    addToCart(item) {
+        const existing = this.cart.find(c => c.id === item.id && c.customStr === item.customStr);
+        if (existing) {
+            existing.qty += item.qty;
+        } else {
+            this.cart.push({ ...item });
+        }
+        this.renderCart();
+        showToast('Item masuk keranjang');
+    },
+
+    updateCartQty(index, delta) {
+        this.cart[index].qty += delta;
+        if (this.cart[index].qty <= 0) this.cart.splice(index, 1);
+        this.renderCart();
+    },
+
+    clearCart() {
+        this.cart = [];
+        discountState = { type: 'NOMINAL', val: 0 };
+        this.renderCart();
+    },
+
+    holdCurrentCart() {
+        if (this.cart.length === 0) return showToast('Keranjang masih kosong!');
+        openAppPrompt('Simpan Pesanan', 'Masukkan catatan atau nama pemesan untuk pesanan hold:', 'Pesanan Meja ' + (Math.floor(Math.random() * 20) + 1), note => {
+            const holds = Storage.get('holdCarts') || [];
+            holds.push({
+                id: 'hold_' + Date.now(),
+                time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+                note: note || 'Tanpa Catatan',
+                cart: [...this.cart],
+                orderType: currentOrderType
+            });
+            Storage.set('holdCarts', holds);
+            this.clearCart();
+            this.updateHoldCount();
+            showToast('Pesanan berhasil disimpan (Hold)');
+        });
+    },
+
+    updateHoldCount() {
+        const holds = Storage.get('holdCarts') || [];
+        document.getElementById('cart-hold-count').innerText = `${holds.length} Pesanan Disimpan`;
+    },
+
+    openHoldModal() {
+        const holds = Storage.get('holdCarts') || [];
+        const container = document.getElementById('hold-carts-list');
+        if (holds.length === 0) {
+            container.innerHTML = `<p class="text-muted text-center" style="padding:2rem;">Tidak ada pesanan tertunda.</p>`;
+        } else {
+            container.innerHTML = holds.map((h, idx) => `
+                <div class="card mb-2 mb-2" style="background:var(--bg-main);">
+                    <div class="flex-between mb-1">
+                        <strong>${h.note} <small class="text-muted">(${h.time})</small></strong>
+                        <span class="chip" style="padding:0.15rem 0.5rem; font-size:0.75rem;">${h.orderType}</span>
+                    </div>
+                    <div class="text-muted mb-2" style="font-size:0.8rem;">
+                        ${h.cart.map(i => `${i.qty}x ${i.name}`).join(', ')}
+                    </div>
+                    <div style="display:flex; gap:0.5rem;">
+                        <button class="btn btn-sm btn-primary" style="flex:1;" onclick="POS.restoreHoldCart(${idx})">Buka / Lanjutkan</button>
+                        <button class="btn btn-sm btn-danger" onclick="POS.deleteHoldCart(${idx})">Hapus</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+        openModal('modal-hold-carts');
+    },
+
+    restoreHoldCart(idx) {
+        const holds = Storage.get('holdCarts') || [];
+        const item = holds[idx];
+        if (!item) return;
+
+        this.cart = [...item.cart];
+        setOrderType(item.orderType || 'DINE_IN');
+        holds.splice(idx, 1);
+        Storage.set('holdCarts', holds);
+
+        closeModal('modal-hold-carts');
+        this.renderCart();
+        this.updateHoldCount();
+        showToast('Pesanan berhasil dimuat ke keranjang');
+    },
+
+    deleteHoldCart(idx) {
+        const holds = Storage.get('holdCarts') || [];
+        holds.splice(idx, 1);
+        Storage.set('holdCarts', holds);
+        this.openHoldModal();
+        this.updateHoldCount();
+    },
+
+    getMarkupPercent() {
+        const settings = Storage.get('settings') || {};
+        if (currentOrderType === 'GOFOOD') return settings.markupGofood || 20;
+        if (currentOrderType === 'GRABFOOD') return settings.markupGrabfood || 20;
+        if (currentOrderType === 'SHOPEEFOOD') return settings.markupShopeefood || 20;
+        return 0;
+    },
+
+    renderCart() {
+        const container = document.getElementById('cart-items');
+        if (this.cart.length === 0) {
+            container.innerHTML = `<p class="text-muted" style="text-align:center; padding:3rem 0;">Keranjang kosong</p>`;
+        } else {
+            container.innerHTML = this.cart.map((item, idx) => `
+                <div class="cart-item">
+                    <div class="flex-between">
+                        <span class="cart-item-name">${item.name}</span>
+                        <strong>Rp${(item.price * item.qty).toLocaleString('id-ID')}</strong>
+                    </div>
+                    ${item.beanName ? `<div class="cart-item-custom"><strong>Beans:</strong> ${item.beanName}</div>` : ''}
+                    ${item.customStr ? `<div class="cart-item-custom">${item.customStr}</div>` : ''}
+                    <div class="flex-between align-center mt-2">
+                        <span class="text-muted" style="font-size:0.8rem;">Rp${item.price.toLocaleString('id-ID')}</span>
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <button class="btn btn-sm btn-outline" onclick="POS.updateCartQty(${idx}, -1)">-</button>
+                            <span style="font-weight:700; font-size:0.85rem;">${item.qty}</span>
+                            <button class="btn btn-sm btn-outline" onclick="POS.updateCartQty(${idx}, 1)">+</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        const subtotal = this.cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+
+        const markupPct = this.getMarkupPercent();
+        const markupAmount = Math.round((subtotal * markupPct) / 100);
+
+        const subtotalWithMarkup = subtotal + markupAmount;
+
+        let discount = 0;
+        if (discountState.type === 'NOMINAL') discount = discountState.val;
+        if (discountState.type === 'PERCENT') discount = (subtotalWithMarkup * discountState.val) / 100;
+        if (discount > subtotalWithMarkup) discount = subtotalWithMarkup;
+
+        const settings = Storage.get('settings') || INITIAL_SEED.settings;
+        const taxRate = settings ? settings.taxRate || 0 : 10;
+        const tax = Math.round(((subtotalWithMarkup - discount) * taxRate) / 100);
+        const total = (subtotalWithMarkup - discount) + tax;
+
+        document.getElementById('cart-subtotal').innerText = `Rp${subtotal.toLocaleString('id-ID')}`;
+
+        const markupRow = document.getElementById('cart-markup-row');
+        if (markupPct > 0) {
+            markupRow.style.display = 'flex';
+            document.getElementById('cart-markup-badge').innerText = `${markupPct}%`;
+            document.getElementById('cart-markup-val').innerText = `+Rp${markupAmount.toLocaleString('id-ID')}`;
+        } else {
+            markupRow.style.display = 'none';
+        }
+
+        document.getElementById('cart-discount-val').innerText = `-Rp${discount.toLocaleString('id-ID')}`;
+        document.getElementById('cart-tax-rate').innerText = taxRate;
+        document.getElementById('cart-tax-val').innerText = `Rp${tax.toLocaleString('id-ID')}`;
+        document.getElementById('cart-total').innerText = `Rp${total.toLocaleString('id-ID')}`;
+    },
+
+    openDiscountModal() {
+        document.getElementById('disc-type').value = discountState.type;
+        document.getElementById('disc-val').value = discountState.val;
+        openModal('modal-discount');
+    },
+
+    applyDiscount() {
+        discountState.type = document.getElementById('disc-type').value;
+        discountState.val = parseFloat(document.getElementById('disc-val').value) || 0;
+        closeModal('modal-discount');
+        this.renderCart();
+        showToast('Diskon diterapkan');
+    },
+
+    openCheckout() {
+        if (this.cart.length === 0) return showToast('Keranjang masih kosong!');
+        const subtotal = this.cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+        const markupPct = this.getMarkupPercent();
+        const markupAmount = Math.round((subtotal * markupPct) / 100);
+        const base = subtotal + markupAmount;
+
+        let discount = discountState.type === 'NOMINAL' ? discountState.val : (base * discountState.val) / 100;
+        const settings = Storage.get('settings') || INITIAL_SEED.settings;
+        const taxRate = settings ? settings.taxRate || 0 : 10;
+        const total = Math.round((base - discount) * (1 + taxRate / 100));
+
+        document.getElementById('co-total-bill').innerText = `Rp${total.toLocaleString('id-ID')}`;
+        document.getElementById('pay-cash-input').value = '';
+        document.getElementById('pay-change').innerText = 'Rp0';
+
+        document.getElementById('co-cust-search').value = '';
+        document.getElementById('co-cust-selected').value = '';
+        document.getElementById('co-order-note').value = '';
+        searchMember('');
+
+        const bankName = settings.bankName || '-';
+        const bankNo = settings.bankNo || '-';
+        const bankHolder = settings.bankHolder || '-';
+        document.getElementById('tf-bank-name').innerText = bankName;
+        document.getElementById('tf-bank-no').innerText = bankNo;
+        document.getElementById('tf-bank-holder').innerText = bankHolder;
+
+        const isOnlineChannel = ['GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'].includes(currentOrderType);
+        const platformPayBtn = document.getElementById('btn-pay-platform');
+        platformPayBtn.style.display = isOnlineChannel ? 'flex' : 'none';
+
+        if (isOnlineChannel) {
+            setPayMethod('PLATFORM_PAY', platformPayBtn);
+        } else {
+            setPayMethod('CASH', document.querySelectorAll('.pay-method-btn')[0]);
+        }
+
+        renderQrisDisplay();
+        openModal('modal-checkout');
+    },
+
+    async processFinalTransaction() {
+        const subtotal = this.cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+        const markupPct = this.getMarkupPercent();
+        const markupAmount = Math.round((subtotal * markupPct) / 100);
+        const base = subtotal + markupAmount;
+
+        let discount = discountState.type === 'NOMINAL' ? discountState.val : (base * discountState.val) / 100;
+        const settings = Storage.get('settings');
+        const taxRate = settings ? settings.taxRate || 0 : 10;
+        const tax = Math.round(((base - discount) * taxRate) / 100);
+        const total = (base - discount) + tax;
+
+        if (currentPayMethod === 'CASH') {
+            const payInput = getCashInputValue();
+            if (payInput < total) return showToast('Nominal pembayaran tunai kurang!');
+        }
+
+        const isOnlineOrder = ['GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'].includes(currentOrderType);
+        let customerName = 'Guest';
+        if (isOnlineOrder) {
+            customerName = document.getElementById('co-cust-name-input').value.trim() || 'Driver';
+        } else if (isMemberMode) {
+            customerName = document.getElementById('co-cust-selected').value || 'Guest';
+        } else {
+            customerName = document.getElementById('co-cust-name-input').value.trim() || 'Guest';
+        }
+
+        const uniqueOrderNum = generateUniqueOrderNum();
+
+        const trx = {
+            id: uniqueOrderNum,
+            date: new Date().toLocaleDateString('id-ID'),
+            time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+            customer: customerName,
+            cashier: (Storage.get('settings') || {}).cashierName || 'Kasir',
+            note: document.getElementById('co-order-note').value.trim(),
+            orderType: currentOrderType,
+            payMethod: currentPayMethod,
+            items: [...this.cart],
+            subtotal,
+            markupAmount,
+            discount, tax, total,
+            cashPaid: currentPayMethod === 'CASH' ? (getCashInputValue() || total) : total,
+            status: 'PAID'
+        };
+
+        const trxs = Storage.get('transactions') || [];
+        trxs.unshift(trx);
+        try {
+            await Storage.set('transactions', trxs);
+            await deductInventoryForTransaction(trx.items);
+        } catch (error) {
+            console.error(error);
+            return showToast('Transaksi gagal disimpan. Cek koneksi internet.');
+        }
+
+        if (customerName !== 'Guest') {
+            const custs = Storage.get('customers') || [];
+            const c = custs.find(item => item.name === customerName);
+            if (c) {
+                c.totalTrx = (c.totalTrx || 0) + 1;
+                c.totalSpend = (c.totalSpend || 0) + total;
+                await Storage.set('customers', custs);
+            }
+        }
+
+        playChimeSound();
+        closeModal('modal-checkout');
+
+        document.getElementById('succ-order-num').innerText = trx.id;
+        document.getElementById('succ-total').innerText = `Rp${total.toLocaleString('id-ID')}`;
+        document.getElementById('succ-channel').innerText = trx.orderType;
+        document.getElementById('succ-method').innerText = currentPayMethod;
+        openModal('modal-success');
+
+        window.lastCompletedTrx = trx;
+        this.clearCart();
+        renderDashboard();
+    }
+};
+
+function generateUniqueOrderNum() {
+    const trxs = Storage.get('transactions') || [];
+    const existingIds = new Set(trxs.map(t => t.id));
+    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    const now = new Date();
+    const dateCode = [String(now.getDate()).padStart(2, '0'), String(now.getMonth() + 1).padStart(2, '0'), String(now.getFullYear()).slice(-2)].join('');
+    let code = '';
+    do {
+        let randomPart = '';
+        for (let i = 0; i < 4; i++) {
+            randomPart += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        code = `INV-${dateCode}-${randomPart}`;
+    } while (existingIds.has(code));
+    return code;
+}
+
+function switchView(target) {
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    document.querySelectorAll('.mob-nav-item').forEach(n => n.classList.remove('active'));
+    document.querySelectorAll('.view-section').forEach(s => s.classList.remove('active'));
+
+    const activeNav = document.querySelector(`.nav-item[onclick*="${target}"]`);
+    if (activeNav) activeNav.classList.add('active');
+
+    const activeMob = document.querySelector(`.mob-nav-item[onclick*="${target}"]`);
+    if (activeMob) activeMob.classList.add('active');
+
+    const activeSection = document.getElementById(`view-${target}`);
+    activeSection.classList.add('active');
+    activeSection.classList.remove('tab-enter');
+    void activeSection.offsetWidth;
+    activeSection.classList.add('tab-enter');
+
+    if (target === 'dashboard') renderDashboard();
+    if (target === 'pos') POS.init();
+    if (target === 'transactions') renderTransactionsTable();
+    if (target === 'menu') renderMenuTable();
+    if (target === 'inventory') renderInventoryTable();
+    if (target === 'beans') renderBeansManager();
+    if (target === 'customers') renderCustomersTable();
+    if (target === 'expenses') renderExpensesTable();
+    if (target === 'reports') renderReports();
+    if (target === 'settings') loadSettingsForm();
+    toggleSidebar(false);
+}
+
+function toggleSidebar(force) {
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.querySelector('.sidebar-overlay');
+    if (!sidebar || !overlay) return;
+    const shouldOpen = typeof force === 'boolean' ? force : !sidebar.classList.contains('open');
+    sidebar.classList.toggle('open', shouldOpen);
+    overlay.classList.toggle('open', shouldOpen);
+}
+
+function openModal(id) { document.getElementById(id).classList.add('active'); }
+function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+function showToast(msg) {
+    const container = document.getElementById('toast-container');
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.innerText = msg;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 2500);
+}
+
+function openAppPrompt(title, message, value, action) {
+    document.getElementById('app-prompt-title').innerText = title;
+    document.getElementById('app-prompt-message').innerText = message;
+    document.getElementById('app-prompt-input').value = value || '';
+    appPromptAction = action;
+    openModal('modal-app-prompt');
+    setTimeout(() => document.getElementById('app-prompt-input').focus(), 50);
+}
+
+function closeAppPrompt() {
+    appPromptAction = null;
+    closeModal('modal-app-prompt');
+}
+
+function submitAppPrompt() {
+    const action = appPromptAction;
+    const value = document.getElementById('app-prompt-input').value;
+    closeAppPrompt();
+    if (action) action(value);
+}
+
+function openAppConfirm(title, message, action) {
+    document.getElementById('app-confirm-title').innerText = title;
+    document.getElementById('app-confirm-message').innerText = message;
+    appConfirmAction = action;
+    openModal('modal-app-confirm');
+}
+
+function closeAppConfirm() {
+    appConfirmAction = null;
+    closeModal('modal-app-confirm');
+}
+
+function submitAppConfirm() {
+    const action = appConfirmAction;
+    closeAppConfirm();
+    if (action) action();
+}
+
+function playBeepSound() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.frequency.value = 800; gain.gain.value = 0.05;
+        osc.start(); osc.stop(ctx.currentTime + 0.05);
+    } catch (e) { }
+}
+
+function playChimeSound() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.frequency.value = 587.33; gain.gain.value = 0.08;
+        osc.start(); osc.stop(ctx.currentTime + 0.15);
+    } catch (e) { }
+}
+
+function setCustomOpt(type, val, extra, btn) {
+    customState[type] = { val, extra };
+    btn.parentElement.querySelectorAll('.opt-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    POS.updateCustomPrice();
+}
+
+function getExtraShotPrice() {
+    return Number((Storage.get('settings') || INITIAL_SEED.settings).extraShotPrice) || INITIAL_SEED.settings.extraShotPrice;
+}
+
+function getCustomOptionPrice(key) {
+    const prices = (Storage.get('settings') || INITIAL_SEED.settings).customOptionPrices || {};
+    return Number(prices[key]) || 0;
+}
+
+function refreshCustomOptionLabels() {
+    const labels = {
+        'custom-less-sugar': ['Less Sugar', 'lessSugar'],
+        'custom-no-sugar': ['No Sugar', 'noSugar'],
+        'custom-less-ice': ['Less Ice', 'lessIce'],
+        'custom-no-ice': ['No Ice', 'noIce'],
+        'custom-hot': ['Hot', 'hot']
+    };
+    Object.entries(labels).forEach(([id, [name, key]]) => {
+        const button = document.getElementById(id);
+        if (button) button.innerText = `${name} (+Rp${getCustomOptionPrice(key).toLocaleString('id-ID')})`;
+    });
+}
+
+function setBeanOpt(bean, btn) {
+    const beanData = (Storage.get('beans') || []).find(item => (typeof item === 'object' ? item.name : item) === bean);
+    customState.bean = POS.getBeanInfo(beanData || bean);
+    btn.parentElement.querySelectorAll('.opt-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    POS.updateCustomPrice();
+}
+
+function addNewBeanOption() {
+    openBeanModal();
+}
+
+function renderBeansManager() {
+    const beans = Storage.get('beans') || [];
+    const container = document.getElementById('beans-manager-list');
+    if (!container) return;
+    container.innerHTML = beans.length ? beans.map((bean, idx) => {
+        const info = POS.getBeanInfo(bean);
+        return `
+        <div class="opt-btn active" style="display:flex; justify-content:space-between; align-items:center; gap:0.75rem;">
+            <span>${info.name}<small class="text-muted"> (+Rp${info.extraPrice.toLocaleString('id-ID')})</small></span>
+            <span class="flex gap-2"><button class="btn btn-sm btn-outline" onclick="openBeanModal(${idx})">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteBean(${idx})">Hapus</button></span>
+        </div>`;
+    }).join('') : '<p class="text-muted">Belum ada beans.</p>';
+}
+
+function openBeanModal(index = null) {
+    editingBeanIndex = index;
+    const existing = index === null ? null : POS.getBeanInfo((Storage.get('beans') || [])[index]);
+    document.getElementById('bean-modal-title').innerText = existing ? 'Edit Beans' : 'Tambah Beans';
+    document.getElementById('bean-name').value = existing?.name || '';
+    document.getElementById('bean-extra-price').value = existing?.extraPrice ? existing.extraPrice.toLocaleString('id-ID') : '';
+    openModal('modal-bean');
+}
+
+function formatBeanPrice(input) {
+    const digits = input.value.replace(/\D/g, '');
+    input.value = digits ? Number(digits).toLocaleString('id-ID') : '';
+}
+
+function saveBean(event) {
+    event.preventDefault();
+    const name = document.getElementById('bean-name').value.trim();
+        const extraPrice = parseInt(document.getElementById('bean-extra-price').value.replace(/\D/g, ''), 10) || 0;
+    if (!name) return;
+    const beans = Storage.get('beans') || [];
+    if (beans.some(bean => bean.toLowerCase() === name.toLowerCase())) return showToast('Beans tersebut sudah ada.');
+    if (editingBeanIndex !== null && beans[editingBeanIndex]) {
+        beans[editingBeanIndex] = { id: beans[editingBeanIndex].id || `bean_${Date.now()}`, name, extraPrice };
+    } else {
+        beans.push({ id: `bean_${Date.now()}`, name, extraPrice });
+    }
+    Storage.set('beans', beans);
+    editingBeanIndex = null;
+    closeModal('modal-bean');
+    renderBeansManager();
+    POS.renderBeanOptions();
+    showToast('Beans berhasil ditambahkan.');
+}
+
+function deleteBean(idx) {
+    const beans = Storage.get('beans') || [];
+    if (!beans[idx]) return;
+    pendingDeleteBeanIndex = idx;
+    document.getElementById('delete-bean-name').innerText = POS.getBeanInfo(beans[idx]).name;
+    openModal('modal-delete-bean');
+}
+
+function confirmDeleteBean() {
+    const beans = Storage.get('beans') || [];
+    if (pendingDeleteBeanIndex === null || !beans[pendingDeleteBeanIndex]) return;
+    beans.splice(pendingDeleteBeanIndex, 1);
+    Storage.set('beans', beans);
+    pendingDeleteBeanIndex = null;
+    closeModal('modal-delete-bean');
+    renderBeansManager();
+    POS.renderBeanOptions();
+    showToast('Beans berhasil dihapus.');
+}
+
+function toggleExtraOpt(val, extra, btn) {
+    const idx = customState.extras.findIndex(e => e.val === val);
+    if (idx > -1) {
+        customState.extras.splice(idx, 1);
+        btn.classList.remove('active');
+    } else {
+        customState.extras.push({ val, extra });
+        btn.classList.add('active');
+    }
+    POS.updateCustomPrice();
+}
+
+function changeCustomQty(delta) {
+    customState.qty += delta;
+    if (customState.qty < 1) customState.qty = 1;
+    document.getElementById('custom-qty-val').innerText = customState.qty;
+    POS.updateCustomPrice();
+}
+
+function setOrderType(type) {
+    currentOrderType = type;
+    document.querySelectorAll('.type-btn').forEach(b => b.classList.remove('active'));
+
+    if (type === 'DINE_IN') document.getElementById('btn-dinein').classList.add('active');
+    if (type === 'TAKE_AWAY') document.getElementById('btn-takeaway').classList.add('active');
+    if (type === 'GOFOOD') document.getElementById('btn-gofood').classList.add('active');
+    if (type === 'GRABFOOD') document.getElementById('btn-grabfood').classList.add('active');
+    if (type === 'SHOPEEFOOD') document.getElementById('btn-shopeefood').classList.add('active');
+
+    const isOnlineOrder = ['GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'].includes(type);
+    const label = document.getElementById('customer-context-label');
+    const customerInput = document.getElementById('co-cust-name-input');
+    const memberToggle = document.getElementById('btn-member-toggle');
+    if (label) label.innerText = isOnlineOrder ? 'NAMA DRIVER / NO ORDER' : 'PELANGGAN';
+    if (customerInput) customerInput.placeholder = isOnlineOrder ? 'Masukkan nama driver / nomor order' : 'Masukkan nama pelanggan';
+    if (isOnlineOrder && isMemberMode) {
+        isMemberMode = false;
+        if (memberToggle) {
+            memberToggle.innerText = 'Member: OFF';
+            memberToggle.classList.remove('active');
+        }
+        document.getElementById('cust-input-container').style.display = 'block';
+        document.getElementById('cust-select-container').style.display = 'none';
+    }
+
+    const isOnlineChannel = ['GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'].includes(type);
+    const platformPayBtn = document.getElementById('btn-pay-platform');
+    if (platformPayBtn) {
+        platformPayBtn.style.display = isOnlineChannel ? 'flex' : 'none';
+        if (isOnlineChannel) setPayMethod('PLATFORM_PAY', platformPayBtn);
+        else if (currentPayMethod === 'PLATFORM_PAY') {
+            setPayMethod('CASH', document.querySelector('.pay-method-btn'));
+        }
+    }
+
+    POS.renderCart();
+}
+
+function setPayMethod(method, btn) {
+    currentPayMethod = method;
+    document.querySelectorAll('.pay-method-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.pay-container').forEach(c => c.classList.remove('active'));
+    if (method === 'CASH') document.getElementById('pay-cash').classList.add('active');
+    if (method === 'QRIS') document.getElementById('pay-qris').classList.add('active');
+    if (method === 'TF') document.getElementById('pay-tf').classList.add('active');
+    if (method === 'DEBIT') document.getElementById('pay-debit').classList.add('active');
+    if (method === 'PLATFORM_PAY') document.getElementById('pay-platform').classList.add('active');
+}
+
+function toggleMemberMode() {
+    isMemberMode = !isMemberMode;
+    const btn = document.getElementById('btn-member-toggle');
+    btn.innerText = `Member: ${isMemberMode ? 'ON' : 'OFF'}`;
+    btn.classList.toggle('active', isMemberMode);
+    document.getElementById('cust-input-container').style.display = isMemberMode ? 'none' : 'block';
+    document.getElementById('cust-select-container').style.display = isMemberMode ? 'block' : 'none';
+    if (isMemberMode) searchMember('');
+    else document.getElementById('co-cust-selected').value = '';
+}
+
+function searchMember(query) {
+    const keyword = (query || '').trim().toLowerCase();
+    const customers = Storage.get('customers') || [];
+    memberSearchResults = customers.filter(customer =>
+        (customer.name || '').toLowerCase().includes(keyword) ||
+        String(customer.phone || '').toLowerCase().includes(keyword)
+    ).slice(0, 8);
+
+    const results = document.getElementById('member-search-results');
+    if (!results) return;
+    results.innerHTML = memberSearchResults.length
+        ? memberSearchResults.map((customer, index) => `
+            <button type="button" class="member-result-item" onclick="selectMember(${index})">
+                <strong>${customer.name}</strong><br>
+                <small class="text-muted">${customer.phone || 'Nomor HP belum diisi'}</small>
+            </button>
+        `).join('')
+        : '<span class="text-muted text-xs">Member tidak ditemukan</span>';
+}
+
+function selectMember(index) {
+    const customer = memberSearchResults[index];
+    if (!customer) return;
+    document.getElementById('co-cust-search').value = `${customer.name} — ${customer.phone || '-'}`;
+    document.getElementById('co-cust-selected').value = customer.name;
+    document.getElementById('member-search-results').innerHTML = '<span class="text-green text-xs">Member dipilih</span>';
+}
+
+function getCashInputValue() {
+    const input = document.getElementById('pay-cash-input');
+    return parseInt((input?.value || '').replace(/\D/g, ''), 10) || 0;
+}
+
+function formatCashInput(input) {
+    const digits = input.value.replace(/\D/g, '');
+    input.value = digits ? Number(digits).toLocaleString('id-ID') : '';
+    calcChange();
+}
+
+function calcChange() {
+    const subtotal = POS.cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+    const markupPct = POS.getMarkupPercent();
+    const markupAmount = Math.round((subtotal * markupPct) / 100);
+    const base = subtotal + markupAmount;
+
+    let discount = discountState.type === 'NOMINAL' ? discountState.val : (base * discountState.val) / 100;
+    const settings = Storage.get('settings');
+    const taxRate = settings ? settings.taxRate || 0 : 10;
+    const total = Math.round((base - discount) * (1 + taxRate / 100));
+
+    const input = getCashInputValue();
+    const change = input - total;
+    document.getElementById('pay-change').innerText = `Rp${change > 0 ? change.toLocaleString('id-ID') : 0}`;
+}
+
+function renderDashboard() {
+    const today = new Date().toLocaleDateString('id-ID');
+    document.getElementById('dash-date-str').innerText = today;
+    updateBusinessDayStatus();
+    const trxs = Storage.get('transactions') || [];
+    const validTrxs = trxs.filter(t => t.status !== 'VOID');
+    const todayTrxs = validTrxs.filter(t => t.date === today);
+
+    const totalSales = todayTrxs.reduce((sum, t) => sum + t.total, 0);
+    const totalItems = todayTrxs.reduce((sum, t) => sum + t.items.reduce((s, i) => s + i.qty, 0), 0);
+    const avgOrder = todayTrxs.length > 0 ? Math.round(totalSales / todayTrxs.length) : 0;
+
+    document.getElementById('dash-sales').innerText = `Rp${totalSales.toLocaleString('id-ID')}`;
+    document.getElementById('dash-count').innerText = todayTrxs.length;
+    document.getElementById('dash-items').innerText = totalItems;
+    document.getElementById('dash-avg').innerText = `Rp${avgOrder.toLocaleString('id-ID')}`;
+
+    const channelTotals = { Offilne: 0, GoFood: 0, GrabFood: 0, ShopeeFood: 0 };
+    todayTrxs.forEach(t => {
+        if (['DINE_IN', 'TAKE_AWAY'].includes(t.orderType)) channelTotals.Offilne += t.total;
+        else if (t.orderType === 'GOFOOD') channelTotals.GoFood += t.total;
+        else if (t.orderType === 'GRABFOOD') channelTotals.GrabFood += t.total;
+        else if (t.orderType === 'SHOPEEFOOD') channelTotals.ShopeeFood += t.total;
+    });
+
+    document.getElementById('dash-channel-breakdown').innerHTML = `
+        <div class="card" style="background:var(--bg-main);">
+            <small class="text-muted">OFFLINE (Kasir)</small>
+            <strong class="text-green" style="display:block; font-size:1.1rem;">Rp${channelTotals.Offilne.toLocaleString('id-ID')}</strong>
+        </div>
+        <div class="card" style="background:var(--bg-main);">
+            <small class="text-muted">ONLINE (Go/Grab/Shopee)</small>
+            <strong class="text-warning" style="display:block; font-size:1.1rem;">Rp${(channelTotals.GoFood + channelTotals.GrabFood + channelTotals.ShopeeFood).toLocaleString('id-ID')}</strong>
+        </div>
+    `;
+
+    const prodCounts = {};
+    validTrxs.forEach(t => t.items.forEach(i => prodCounts[i.name] = (prodCounts[i.name] || 0) + i.qty));
+    const sortedProds = Object.entries(prodCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+    document.getElementById('dash-bestsellers').innerHTML = sortedProds.length ? sortedProds.map(([name, qty]) => `
+        <div class="flex-between" style="padding:0.4rem 0; border-bottom:1px solid var(--border);">
+            <span>${name}</span>
+            <strong class="text-green">${qty} terjual</strong>
+        </div>
+    `).join('') : '<p class="text-muted">Belum ada penjualan</p>';
+
+    const ings = Storage.get('ingredients') || [];
+    const stockAlert = document.getElementById('dash-stock-alert');
+    const lowStock = ings.filter(i => i.stock <= i.minStock);
+    if (stockAlert) {
+        const outOfStock = lowStock.filter(i => Number(i.stock) <= 0);
+        if (lowStock.length) {
+            stockAlert.className = `stock-alert ${outOfStock.length ? 'stock-alert-danger' : 'stock-alert-warning'}`;
+            stockAlert.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><div><strong>${outOfStock.length ? 'Ada stok yang habis' : 'Stok mulai menipis'}</strong><span>${lowStock.length} bahan perlu dicek${outOfStock.length ? `, ${outOfStock.length} sudah habis` : ''}.</span></div><button class="btn btn-sm btn-outline" onclick="switchView('inventory')">Cek Inventory</button>`;
+        } else {
+            stockAlert.className = 'stock-alert stock-alert-safe';
+            stockAlert.innerHTML = '<i class="fa-solid fa-circle-check"></i><div><strong>Stok aman</strong><span>Belum ada bahan yang berada di bawah stok minimum.</span></div>';
+        }
+    }
+    document.getElementById('dash-lowstock').innerHTML = lowStock.length ? lowStock.map(i => `
+        <div class="flex-between" style="padding:0.4rem 0;">
+            <span>${i.name}</span>
+            <strong class="text-danger">${formatQuantity(i.stock)} ${i.unit}</strong>
+        </div>
+    `).join('') : '<p class="text-muted">Stok aman</p>';
+
+    document.getElementById('dash-recent-trxs').innerHTML = trxs.slice(0, 3).length ? trxs.slice(0, 3).map(t => `
+        <div class="flex-between" style="padding:0.4rem 0; border-bottom:1px solid var(--border);">
+            <div><strong>${t.id}</strong> <small class="text-muted">(${t.orderType})</small></div>
+            <strong class="${t.status === 'VOID' ? 'text-danger' : 'text-green'}">Rp${t.total.toLocaleString('id-ID')} ${t.status === 'VOID' ? '(VOID)' : ''}</strong>
+        </div>
+    `).join('') : '<p class="text-muted">Belum ada transaksi</p>';
+
+    const statsEl = document.getElementById('dash-statistics');
+    if (statsEl) {
+        const days = Array.from({ length: 7 }, (_, index) => {
+            const date = new Date();
+            date.setHours(0, 0, 0, 0);
+            date.setDate(date.getDate() - (6 - index));
+            const label = date.toLocaleDateString('id-ID', { weekday: 'short' });
+            const key = date.toLocaleDateString('id-ID');
+            const total = validTrxs.filter(t => t.date === key).reduce((sum, t) => sum + (Number(t.total) || 0), 0);
+            return { label, total };
+        });
+        const maxTotal = Math.max(...days.map(day => day.total), 1);
+        const paymentCounts = {};
+        todayTrxs.forEach(t => paymentCounts[t.paymentMethod || 'Lainnya'] = (paymentCounts[t.paymentMethod || 'Lainnya'] || 0) + 1);
+        const paymentText = Object.entries(paymentCounts).map(([method, count]) => `${method}: ${count}`).join(' • ') || 'Belum ada transaksi hari ini';
+        statsEl.innerHTML = `<div class="sales-bars">${days.map(day => `<div class="sales-bar-item"><span class="sales-bar-value">${day.total ? `Rp${Math.round(day.total / 1000)}k` : '-'}</span><div class="sales-bar-track"><div class="sales-bar-fill" style="height:${day.total ? Math.max(8, (day.total / maxTotal) * 100) : 3}%"></div></div><small>${day.label}</small></div>`).join('')}</div><div class="stats-summary"><i class="fa-solid fa-wallet"></i><span>Transaksi hari ini: <strong>${paymentText}</strong></span></div>`;
+    }
+
+    updateBrandLogoDisplay();
+}
+
+function updateBrandLogoDisplay() {
+    const settings = Storage.get('settings') || {};
+    const name = settings.cafeName || 'NexPOS Coffee';
+    document.getElementById('sidebar-brand-name').innerText = name;
+
+    const logoContainer = document.getElementById('brand-logo-container');
+    if (settings.logoImage) {
+        logoContainer.innerHTML = `<img src="${settings.logoImage}" alt="Logo">`;
+    } else {
+        logoContainer.innerHTML = `<i class="fa-solid fa-mug-hot"></i>`;
+    }
+}
+
+function renderTransactionsTable() {
+    const search = document.getElementById('trx-search').value.toLowerCase();
+    const trxs = Storage.get('transactions') || [];
+    const filtered = trxs.filter(t => t.id.toLowerCase().includes(search) || t.customer.toLowerCase().includes(search) || t.orderType.toLowerCase().includes(search));
+
+    document.getElementById('trx-tbody').innerHTML = filtered.map(t => `
+        <tr style="${t.status === 'VOID' ? 'opacity:0.5; background:#FAF0F0;' : ''}">
+            <td><strong>${t.id}</strong></td>
+            <td>${t.date} ${t.time}</td>
+            <td><span class="chip" style="padding:0.15rem 0.5rem; font-size:0.75rem;">${t.orderType}</span></td>
+            <td>${t.customer}</td>
+            <td><span class="chip" style="padding:0.15rem 0.5rem; font-size:0.75rem;">${t.payMethod}</span></td>
+            <td><strong>Rp${t.total.toLocaleString('id-ID')}</strong></td>
+            <td>
+                <span class="${t.status === 'VOID' ? 'text-danger' : 'text-green'}" style="font-weight:700;">
+                    ${t.status || 'PAID'}
+                </span>
+            </td>
+            <td>
+                <button class="btn btn-sm btn-outline" onclick="reprintReceipt('${t.id}')"><i class="fa-solid fa-print"></i> Struk</button>
+                ${t.status !== 'VOID' ? `<button class="btn btn-sm btn-warning" onclick="voidTransaction('${t.id}')" title="Void Transaksi"><i class="fa-solid fa-ban"></i> Void</button>` : ''}
+                <button class="btn btn-sm btn-danger" onclick="requestDeleteTransaction('${t.id}')" title="Hapus permanen"><i class="fa-solid fa-trash"></i> Hapus</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function voidTransaction(id) {
+    openAppPrompt('Void Transaksi', 'Masukkan alasan pembatalan transaksi:', '', reason => {
+        const trxs = Storage.get('transactions') || [];
+        const t = trxs.find(item => item.id === id);
+        if (t) {
+            t.status = 'VOID';
+            t.voidReason = reason || 'Tanpa alasan';
+            Storage.set('transactions', trxs);
+            renderTransactionsTable();
+            renderDashboard();
+            showToast('Transaksi dibatalkan (Void)');
+        }
+    });
+}
+
+let pendingDeleteTransactionId = null;
+
+function requestDeleteTransaction(id) {
+    pendingDeleteTransactionId = id;
+    const input = document.getElementById('delete-transaction-pin');
+    input.value = '';
+    openModal('modal-delete-transaction');
+    setTimeout(() => input.focus(), 50);
+}
+
+function confirmDeleteTransaction(event) {
+    event.preventDefault();
+    const settings = Storage.get('settings') || {};
+    const configuredPin = String(settings.deleteTransactionPin || '1234');
+    const input = document.getElementById('delete-transaction-pin');
+    if (input.value !== configuredPin) {
+        showToast('PIN salah. Transaksi tidak dihapus.');
+        input.select();
+        return;
+    }
+
+    const trxs = Storage.get('transactions') || [];
+    const deleted = trxs.find(t => t.id === pendingDeleteTransactionId);
+    if (!deleted) return showToast('Transaksi tidak ditemukan.');
+
+    Storage.set('transactions', trxs.filter(t => t.id !== pendingDeleteTransactionId));
+    pendingDeleteTransactionId = null;
+    closeModal('modal-delete-transaction');
+    renderTransactionsTable();
+    renderDashboard();
+    showToast(`Transaksi ${deleted.id} berhasil dihapus`);
+}
+
+function downloadDailyFile(filename, content, type) {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function closeDayAndExport(targetKey = dayKey()) {
+    const settings = Storage.get('settings') || INITIAL_SEED.settings;
+    openAppPrompt('Verifikasi Tutup Hari', 'Masukkan PIN untuk menutup hari dan mereset data harian:', '', pin => {
+        if (String(pin) !== String(settings.deleteTransactionPin || '1234')) return showToast('PIN tutup hari salah.');
+
+        const displayDate = new Date(targetKey + 'T00:00:00').toLocaleDateString('id-ID');
+        const trxs = (Storage.get('transactions') || []).filter(t => t.date === displayDate);
+        const exps = (Storage.get('expenses') || []).filter(e => e.date === displayDate);
+        if (!trxs.length && !exps.length) return showToast('Tidak ada data untuk diexport pada hari ini.');
+
+        const validTrxs = trxs.filter(t => t.status !== 'VOID');
+        const omzet = validTrxs.reduce((sum, t) => sum + (Number(t.total) || 0), 0);
+        const totalExpenses = exps.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+        const cell = value => '"' + String(value ?? '').replaceAll('"', '""') + '"';
+        const rows = [
+            ['TIPE', 'ID', 'TANGGAL', 'JAM', 'KETERANGAN', 'METODE', 'NOMINAL', 'STATUS'],
+            ...trxs.map(t => ['PENJUALAN', t.id, t.date, t.time, t.customer || '-', t.payMethod || '-', t.total, t.status || 'PAID']),
+            ...exps.map((e, i) => ['PENGELUARAN', 'EXP-' + (i + 1), e.date || '-', e.time || '-', e.title || e.name || e.category || '-', '-', e.amount || 0, 'RECORDED'])
+        ];
+        const backup = {
+            app: 'NexPOS Coffee Studio', version: 2, exportedAt: new Date().toISOString(),
+            businessDate: targetKey, summary: { transactions: validTrxs.length, omzet, expenses: totalExpenses, net: omzet - totalExpenses },
+            data: { transactions: trxs, expenses: exps }
+        };
+        downloadDailyFile('nexpos_harian_' + targetKey + '.csv', '\uFEFF' + rows.map(row => row.map(cell).join(',')).join('\r\n'), 'text/csv;charset=utf-8');
+        downloadDailyFile('nexpos_harian_' + targetKey + '.json', JSON.stringify(backup, null, 2), 'application/json;charset=utf-8');
+
+        openAppConfirm('Konfirmasi Tutup Hari', 'Transaksi: ' + validTrxs.length + ' | Omzet: Rp' + omzet.toLocaleString('id-ID') + ' | Pengeluaran: Rp' + totalExpenses.toLocaleString('id-ID') + ' | Bersih: Rp' + (omzet - totalExpenses).toLocaleString('id-ID') + '. CSV dan JSON sudah dibuat. Reset data sekarang?', async () => {
+            await Storage.set('transactions', []);
+            await Storage.set('expenses', []);
+            await Storage.set('holdCarts', []);
+            localStorage.setItem('nexpos_business_date', targetKey);
+            document.getElementById('mandatory-close-day')?.classList.remove('active');
+            updateBusinessDayStatus();
+            renderDashboard();
+            renderTransactionsTable();
+            showToast('Hari berhasil ditutup dan data harian di-reset.');
+        });
+    });
+}
+function updateBusinessDayStatus() {
+    const status = document.getElementById('business-day-status');
+    if (!status) return;
+    const pending = (Storage.get('transactions') || []).length + (Storage.get('expenses') || []).length;
+    status.innerText = pending ? 'Status: Belum ditutup' : 'Status: Sudah ditutup / belum ada data';
+    status.className = pending ? 'text-danger text-sm' : 'text-muted text-sm';
+}
+function showMandatoryCloseDay(lastOpen) {
+    const modal = document.getElementById('mandatory-close-day');
+    if (!modal) return;
+    modal.dataset.pendingDate = lastOpen;
+    document.getElementById('mandatory-close-day-text').innerText = 'Data tanggal ' + lastOpen + ' belum diexport. Export CSV + JSON wajib dilakukan sebelum kasir melanjutkan.';
+    modal.classList.add('active');
+}
+function exportTransactionsCSV() {
+    const trxs = Storage.get('transactions') || [];
+    if (trxs.length === 0) return showToast('Tidak ada data transaksi!');
+
+    let csv = 'Order ID,Tanggal,Jam,Channel,Pelanggan,Metode,Total,Status';
+    trxs.forEach(t => {
+        csv += `"${t.id}","${t.date}","${t.time}","${t.orderType}","${t.customer}","${t.payMethod}",${t.total},"${t.status || 'PAID'}"
+`;
+    });
+
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `laporan_transaksi_${Date.now()}.csv`;
+    a.click();
+}
+
+function exportFullBackup() {
+    const dataKeys = ['products', 'categories', 'ingredients', 'recipes', 'customers', 'transactions', 'expenses', 'beans', 'holdCarts', 'settings'];
+    const backup = {
+        app: 'NexPOS Coffee Studio',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        data: Object.fromEntries(dataKeys.map(key => [key, Storage.get(key)]))
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `backup_nexpos_${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast(`Backup berhasil dibuat (${(backup.data.transactions || []).length} transaksi)`);
+}
+
+function restoreBackupFile(event) {
+    const file = event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        let backup;
+        try { backup = JSON.parse(reader.result); } catch (error) { return showToast('File backup tidak valid.'); }
+        const keys = ['products', 'categories', 'ingredients', 'recipes', 'customers', 'transactions', 'expenses', 'beans', 'holdCarts', 'settings'];
+        if (!backup.data || !keys.some(key => Object.prototype.hasOwnProperty.call(backup.data, key))) return showToast('Format backup NexPOS tidak dikenali.');
+        const settings = Storage.get('settings') || INITIAL_SEED.settings;
+        openAppPrompt('Verifikasi Restore', 'Masukkan PIN untuk memulihkan backup. Data saat ini akan diganti.', '', pin => {
+            if (pin !== settings.deleteTransactionPin) return showToast('PIN restore salah.');
+            openAppConfirm('Restore Backup?', 'Data saat ini akan diganti dengan isi file backup.', async () => {
+                try {
+                    for (const key of keys) if (Object.prototype.hasOwnProperty.call(backup.data, key)) await Storage.set(key, backup.data[key]);
+                    showToast('Backup berhasil dipulihkan.');
+                    setTimeout(() => location.reload(), 700);
+                } catch (error) { showToast('Restore gagal disimpan.'); }
+            });
+        });
+    };
+    reader.readAsText(file);
+}
+
+function renderMenuTable() {
+    const products = Storage.get('products') || [];
+    document.getElementById('menu-tbody').innerHTML = products.map(p => `
+        <tr>
+            <td><strong>${p.name}</strong></td>
+            <td>${p.category}</td>
+            <td>Rp${p.price.toLocaleString('id-ID')}</td>
+            <td><span class="${p.status === 'ACTIVE' ? 'text-green' : 'text-danger'}" style="font-weight:700;">${p.status}</span></td>
+            <td><button class="btn btn-sm btn-outline" onclick="openRecipeModal('${p.id}')">Atur Resep</button></td>
+            <td>
+                <button class="btn btn-sm btn-outline" onclick="editProduct('${p.id}')">Edit</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteProduct('${p.id}')">Hapus</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function openProductModal(editId = null) {
+    const cats = Storage.get('categories') || [];
+    const catSelect = document.getElementById('prod-cat');
+    catSelect.innerHTML = cats.map(c => {
+        const name = typeof c === 'object' ? c.name : c;
+        return `<option value="${name}">${name}</option>`;
+    }).join('');
+
+    if (editId) {
+        const p = Storage.get('products').find(item => item.id === editId);
+        document.getElementById('prod-id').value = p.id;
+        document.getElementById('prod-name').value = p.name;
+        document.getElementById('prod-cat').value = p.category;
+        document.getElementById('prod-price').value = Number(p.price || 0).toLocaleString('id-ID');
+        document.getElementById('prod-status').value = p.status;
+        document.getElementById('prod-modal-title').innerText = 'Edit Menu';
+    } else {
+        document.getElementById('prod-id').value = '';
+        document.getElementById('prod-name').value = '';
+        document.getElementById('prod-price').value = '';
+        document.getElementById('prod-status').value = 'ACTIVE';
+        document.getElementById('prod-modal-title').innerText = 'Tambah Menu';
+    }
+    openModal('modal-product');
+}
+
+function saveProduct() {
+    const id = document.getElementById('prod-id').value || 'p_' + Date.now();
+    const name = document.getElementById('prod-name').value.trim();
+    const category = document.getElementById('prod-cat').value;
+    const price = parseInt(document.getElementById('prod-price').value.replace(/\D/g, ''), 10) || 0;
+    const status = document.getElementById('prod-status').value;
+
+    if (!name) return showToast('Nama menu wajib diisi!');
+
+    let products = Storage.get('products') || [];
+    const idx = products.findIndex(p => p.id === id);
+    if (idx > -1) {
+        products[idx] = { id, name, category, price, status };
+    } else {
+        products.push({ id, name, category, price, status });
+    }
+    Storage.set('products', products);
+    closeModal('modal-product');
+    renderMenuTable();
+    showToast('Menu berhasil disimpan');
+}
+
+function editProduct(id) { openProductModal(id); }
+
+function openRecipeModal(productId) {
+    const product = (Storage.get('products') || []).find(p => p.id === productId);
+    if (!product) return showToast('Menu tidak ditemukan.');
+    editingRecipeProductId = productId;
+    document.getElementById('recipe-product-name').innerText = `Menu: ${product.name}`;
+    renderRecipeRows((Storage.get('recipes') || {})[productId] || []);
+    openModal('modal-recipe');
+}
+
+function renderRecipeRows(rows = []) {
+    const container = document.getElementById('recipe-rows');
+    const ingredients = Storage.get('ingredients') || [];
+    container.innerHTML = rows.length ? rows.map((row, index) => `
+        <div class="recipe-row" style="display:grid; grid-template-columns:1fr 90px 100px auto; gap:0.5rem; align-items:end; margin-bottom:0.75rem;">
+            <div><label class="form-label">Bahan</label><select class="form-control recipe-ingredient"><option value="">Pilih bahan</option>${ingredients.map(i => `<option value="${i.id}" ${i.id === row.ingredientId ? 'selected' : ''}>${i.name} (${i.unit})</option>`).join('')}</select></div>
+            <div><label class="form-label">Takaran</label><input type="number" class="form-control recipe-qty" min="0.01" step="0.01" value="${row.qty || 1}"></div>
+            <div><label class="form-label">Satuan</label><select class="form-control recipe-unit">${['gram', 'kg', 'ml', 'liter', 'pcs', 'pack'].map(unit => `<option value="${unit}" ${unit === (row.unit || ingredients.find(i => i.id === row.ingredientId)?.unit || 'gram') ? 'selected' : ''}>${unit}</option>`).join('')}</select></div>
+            <button class="btn btn-sm btn-danger" onclick="this.closest('.recipe-row').remove()">Hapus</button>
+        </div>`).join('') : '<p class="text-muted text-sm mb-2">Belum ada resep. Tambahkan bahan yang dipakai menu ini.</p>';
+}
+
+function addRecipeRow() {
+    const container = document.getElementById('recipe-rows');
+    if (container.querySelector('.text-muted')) container.innerHTML = '';
+    renderRecipeRows([...Array.from(container.querySelectorAll('.recipe-row')).map(row => ({
+        ingredientId: row.querySelector('.recipe-ingredient').value,
+        qty: row.querySelector('.recipe-qty').value,
+        unit: row.querySelector('.recipe-unit')?.value || ''
+    })), { ingredientId: '', qty: 1 }]);
+}
+
+function saveRecipe() {
+    if (!editingRecipeProductId) return;
+    const rows = [...document.querySelectorAll('#recipe-rows .recipe-row')].map(row => ({
+        ingredientId: row.querySelector('.recipe-ingredient').value,
+        qty: parseFloat(row.querySelector('.recipe-qty').value) || 0,
+        unit: row.querySelector('.recipe-unit').value
+    })).filter(row => row.ingredientId && row.qty > 0);
+    const recipes = Storage.get('recipes') || {};
+    recipes[editingRecipeProductId] = rows;
+    Storage.set('recipes', recipes);
+    closeModal('modal-recipe');
+    showToast('Resep berhasil disimpan.');
+}
+
+async function deductInventoryForTransaction(items) {
+    const ingredients = Storage.get('ingredients') || [];
+    const recipes = Storage.get('recipes') || {};
+    let changed = false;
+    items.forEach(item => {
+        (recipes[item.id] || []).forEach(recipeItem => {
+            const ingredient = ingredients.find(i => i.id === recipeItem.ingredientId);
+            if (ingredient) {
+                const convertedQty = convertUnit(recipeItem.qty, recipeItem.unit, ingredient.unit);
+                ingredient.stock = Math.max(0, Number(((Number(ingredient.stock) || 0) - (convertedQty * Number(item.qty || 1))).toFixed(6)));
+                changed = true;
+            }
+        });
+    });
+    if (changed) {
+        await Storage.set('ingredients', ingredients);
+        renderInventoryTable();
+        renderDashboard();
+    }
+}
+
+function convertUnit(quantity, fromUnit, toUnit) {
+    const from = String(fromUnit || '').toLowerCase();
+    const to = String(toUnit || '').toLowerCase();
+    if (from === to) return Number(quantity) || 0;
+    const grams = { gram: 1, kg: 1000 };
+    const milliliters = { ml: 1, liter: 1000 };
+    if (grams[from] && grams[to]) return (Number(quantity) * grams[from]) / grams[to];
+    if (milliliters[from] && milliliters[to]) return (Number(quantity) * milliliters[from]) / milliliters[to];
+    return Number(quantity) || 0;
+}
+
+function formatQuantity(value) {
+    const number = Number(value) || 0;
+    return number.toLocaleString('id-ID', { maximumFractionDigits: 4 });
+}
+
+function formatPriceInput(input) {
+    const digits = input.value.replace(/\D/g, '');
+    input.value = digits ? Number(digits).toLocaleString('id-ID') : '';
+}
+
+function deleteProduct(id) {
+    const product = (Storage.get('products') || []).find(p => p.id === id);
+    if (!product) return showToast('Menu tidak ditemukan.');
+    pendingDeleteProductId = id;
+    document.getElementById('delete-product-name').innerText = product.name;
+    openModal('modal-delete-product');
+}
+
+function confirmDeleteProduct() {
+    if (!pendingDeleteProductId) return;
+    const products = Storage.get('products') || [];
+    Storage.set('products', products.filter(p => p.id !== pendingDeleteProductId));
+    pendingDeleteProductId = null;
+    closeModal('modal-delete-product');
+    renderMenuTable();
+    showToast('Menu berhasil dihapus.');
+}
+
+function openCategoryModal() {
+    renderCategoryList();
+    openModal('modal-category');
+}
+
+function renderCategoryList() {
+    const cats = Storage.get('categories') || [];
+    document.getElementById('cat-list-container').innerHTML = cats.map((c, idx) => {
+        const name = typeof c === 'object' ? c.name : c;
+        return `
+            <div class="flex-between mb-2">
+                <span>${name}</span>
+                <button class="btn btn-sm btn-danger" onclick="deleteCategory(${idx})">Hapus</button>
+            </div>
+        `;
+    }).join('');
+}
+
+function addCategory() {
+    const input = document.getElementById('cat-new-name');
+    const val = input.value.trim();
+    if (!val) return;
+    let cats = Storage.get('categories') || [];
+    cats.push(val);
+    Storage.set('categories', cats);
+    input.value = '';
+    renderCategoryList();
+    showToast('Kategori ditambahkan');
+}
+
+function deleteCategory(idx) {
+    let cats = Storage.get('categories') || [];
+    cats.splice(idx, 1);
+    Storage.set('categories', cats);
+    renderCategoryList();
+}
+
+function renderInventoryTable() {
+    const ings = Storage.get('ingredients') || [];
+    document.getElementById('inventory-tbody').innerHTML = ings.map(i => {
+        const status = i.stock <= 0 ? 'Habis' : (i.stock <= i.minStock ? 'Menipis' : 'Aman');
+        const color = i.stock <= 0 ? 'text-danger' : (i.stock <= i.minStock ? 'text-warning' : 'text-green');
+        return `
+            <tr>
+                <td><strong>${i.name}</strong></td>
+                <td>${formatQuantity(i.stock)} ${i.unit}</td>
+                <td>${formatQuantity(i.minStock)} ${i.unit}</td>
+                <td><span class="${color}" style="font-weight:700;">${status}</span></td>
+                <td>
+                    <div class="flex gap-2">
+                        <button class="btn btn-sm btn-outline" onclick="openRestockModal('${i.id}')">Restock</button>
+                        <button class="btn btn-sm btn-danger" onclick="deleteIngredient('${i.id}')">Hapus</button>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function openAddIngredientModal() {
+    document.getElementById('ingredient-name').value = '';
+    document.getElementById('ingredient-unit').value = 'kg';
+    document.getElementById('ingredient-stock').value = '0';
+    document.getElementById('ingredient-min-stock').value = '1';
+    openModal('modal-add-ingredient');
+}
+
+function saveIngredient(event) {
+    event.preventDefault();
+    const name = document.getElementById('ingredient-name').value.trim();
+    const unit = document.getElementById('ingredient-unit').value;
+    const stock = parseFloat(document.getElementById('ingredient-stock').value) || 0;
+    const minStock = parseFloat(document.getElementById('ingredient-min-stock').value) || 0;
+    if (!name) return showToast('Nama bahan wajib diisi.');
+
+    const ingredients = Storage.get('ingredients') || [];
+    if (ingredients.some(i => i.name.toLowerCase() === name.toLowerCase())) {
+        return showToast('Bahan dengan nama tersebut sudah ada.');
+    }
+    ingredients.push({ id: `ing_${Date.now()}`, name, unit, stock, minStock });
+    Storage.set('ingredients', ingredients);
+    closeModal('modal-add-ingredient');
+    renderInventoryTable();
+    showToast('Bahan berhasil ditambahkan.');
+}
+
+function deleteIngredient(ingId) {
+    const ingredients = Storage.get('ingredients') || [];
+    const ingredient = ingredients.find(i => i.id === ingId);
+    if (!ingredient) return showToast('Bahan tidak ditemukan.');
+    openAppConfirm('Hapus Bahan?', `Bahan ${ingredient.name} akan dihapus dari inventory.`, () => {
+        Storage.set('ingredients', ingredients.filter(i => i.id !== ingId));
+        renderInventoryTable();
+        showToast('Bahan berhasil dihapus.');
+    });
+}
+
+function openRestockModal(ingId = null) {
+    const ings = Storage.get('ingredients') || [];
+    const select = document.getElementById('restock-ing-id');
+    select.innerHTML = ings.length
+        ? ings.map(i => `<option value="${i.id}">${i.name} (Stok: ${formatQuantity(i.stock)} ${i.unit})</option>`).join('')
+        : '<option value="">Belum ada bahan — tambah bahan dulu</option>';
+    document.getElementById('restock-qty').value = '1';
+    document.querySelector('#modal-restock button[onclick="saveRestock()"]')?.toggleAttribute('disabled', !ings.length);
+    if (ingId) select.value = ingId;
+    openModal('modal-restock');
+}
+
+function saveRestock() {
+    const id = document.getElementById('restock-ing-id').value;
+    const qty = parseFloat(document.getElementById('restock-qty').value) || 0;
+    if (qty <= 0) return showToast('Jumlah stok harus lebih dari 0.');
+    let ings = Storage.get('ingredients') || [];
+    const i = ings.find(item => item.id === id);
+    if (i) {
+        i.stock = Number((Number(i.stock || 0) + qty).toFixed(6));
+        Storage.set('ingredients', ings);
+        closeModal('modal-restock');
+        renderInventoryTable();
+        showToast('Stok berhasil diperbarui');
+    }
+}
+
+function renderCustomersTable(query = document.getElementById('customer-search')?.value || '') {
+    const custs = Storage.get('customers') || [];
+    const keyword = String(query).trim().toLowerCase();
+    const filtered = custs.map((customer, index) => ({ customer, index })).filter(({ customer }) =>
+        !keyword || String(customer.name || '').toLowerCase().includes(keyword) || String(customer.phone || '').toLowerCase().includes(keyword)
+    );
+    document.getElementById('customers-tbody').innerHTML = filtered.length ? filtered.map(({ customer: c, index: idx }) => `
+        <tr>
+            <td><strong>${c.name}</strong></td>
+            <td>${c.phone}</td>
+            <td>${c.totalTrx || 0}x</td>
+            <td>Rp${(c.totalSpend || 0).toLocaleString('id-ID')}</td>
+            <td><button class="btn btn-sm btn-danger" onclick="deleteCustomer(${idx})">Hapus</button></td>
+        </tr>
+    `).join('') : '<tr><td colspan="5" class="text-muted text-center">Pelanggan tidak ditemukan.</td></tr>';
+}
+
+function openCustomerModal() {
+    document.getElementById('cust-name').value = '';
+    document.getElementById('cust-phone').value = '';
+    openModal('modal-customer');
+}
+
+function saveCustomer() {
+    const name = document.getElementById('cust-name').value.trim();
+    const phone = document.getElementById('cust-phone').value.trim();
+    if (!name) return showToast('Nama pelanggan wajib diisi!');
+
+    let custs = Storage.get('customers') || [];
+    custs.push({ name, phone, totalTrx: 0, totalSpend: 0 });
+    Storage.set('customers', custs);
+    closeModal('modal-customer');
+    renderCustomersTable();
+    showToast('Pelanggan berhasil disimpan');
+}
+
+function importCustomersCSV(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        const lines = String(reader.result || '').replace(/^\uFEFF/, '').split(/\r?\n/).filter(line => line.trim());
+        if (!lines.length) return showToast('File CSV kosong.');
+        const parseLine = line => {
+            const values = [];
+            let value = '', quoted = false;
+            for (let i = 0; i < line.length; i++) {
+                const char = line[i];
+                if (char === '"' && line[i + 1] === '"' && quoted) { value += '"'; i++; }
+                else if (char === '"') quoted = !quoted;
+                else if ((char === ',' || char === ';') && !quoted) { values.push(value.trim()); value = ''; }
+                else value += char;
+            }
+            values.push(value.trim());
+            return values;
+        };
+        const firstRow = parseLine(lines[0]).map(value => value.toLowerCase());
+        const nameIndex = firstRow.findIndex(value => ['nama', 'nama pelanggan', 'name', 'customer'].includes(value));
+        const phoneIndex = firstRow.findIndex(value => ['phone', 'no hp', 'nomor hp', 'whatsapp', 'no whatsapp', 'telepon'].includes(value));
+        const hasHeader = nameIndex >= 0 || phoneIndex >= 0;
+        const start = hasHeader ? 1 : 0;
+        const resolvedNameIndex = nameIndex >= 0 ? nameIndex : 0;
+        const resolvedPhoneIndex = phoneIndex >= 0 ? phoneIndex : 1;
+        const customers = Storage.get('customers') || [];
+        const existingPhones = new Set(customers.map(customer => String(customer.phone || '').replace(/\D/g, '')) .filter(Boolean));
+        let added = 0, skipped = 0;
+        lines.slice(start).forEach(line => {
+            const values = parseLine(line);
+            const name = String(values[resolvedNameIndex] || '').trim();
+            const phone = String(values[resolvedPhoneIndex] || '').trim();
+            const phoneKey = phone.replace(/\D/g, '');
+            if (!name || (phoneKey && existingPhones.has(phoneKey))) { skipped++; return; }
+            customers.push({ name, phone, totalTrx: 0, totalSpend: 0 });
+            if (phoneKey) existingPhones.add(phoneKey);
+            added++;
+        });
+        if (!added) return showToast(`Tidak ada data baru. ${skipped} baris dilewati.`);
+        Storage.set('customers', customers);
+        renderCustomersTable();
+        showToast(`${added} pelanggan berhasil diimport${skipped ? `, ${skipped} dilewati` : ''}.`);
+    };
+    reader.onerror = () => showToast('CSV tidak bisa dibaca.');
+    reader.readAsText(file);
+}
+
+function deleteCustomer(idx) {
+    let custs = Storage.get('customers') || [];
+    custs.splice(idx, 1);
+    Storage.set('customers', custs);
+    renderCustomersTable();
+}
+
+function renderExpensesTable() {
+    const exps = Storage.get('expenses') || [];
+    document.getElementById('expenses-tbody').innerHTML = exps.map((e, idx) => `
+        <tr>
+            <td>${e.date}</td>
+            <td><strong>${e.name}</strong></td>
+            <td>${e.category}</td>
+            <td class="text-danger">Rp${e.amount.toLocaleString('id-ID')}</td>
+            <td><button class="btn btn-sm btn-danger" onclick="deleteExpense(${idx})">Hapus</button></td>
+        </tr>
+    `).join('');
+}
+
+function openExpenseModal() {
+    document.getElementById('exp-name').value = '';
+    document.getElementById('exp-amount').value = '';
+    openModal('modal-expense');
+}
+
+function saveExpense() {
+    const name = document.getElementById('exp-name').value.trim();
+    const category = document.getElementById('exp-cat').value;
+    const amount = parseFloat(document.getElementById('exp-amount').value) || 0;
+    if (!name) return showToast('Nama pengeluaran wajib diisi!');
+
+    let exps = Storage.get('expenses') || [];
+    exps.unshift({
+        date: new Date().toLocaleDateString('id-ID'),
+        name, category, amount
+    });
+    Storage.set('expenses', exps);
+    closeModal('modal-expense');
+    renderExpensesTable();
+    showToast('Pengeluaran dicatat');
+}
+
+function deleteExpense(idx) {
+    let exps = Storage.get('expenses') || [];
+    exps.splice(idx, 1);
+    Storage.set('expenses', exps);
+    renderExpensesTable();
+}
+
+function renderReports() {
+    const trxs = Storage.get('transactions') || [];
+    const exps = Storage.get('expenses') || [];
+    const from = document.getElementById('rep-date-from')?.value || '';
+    const to = document.getElementById('rep-date-to')?.value || '';
+    const inPeriod = date => isReportDateInRange(date, from, to);
+    const validTrxs = trxs.filter(t => t.status !== 'VOID' && inPeriod(t.date));
+    const filteredExps = exps.filter(e => inPeriod(e.date));
+
+    const totalOmzet = validTrxs.reduce((sum, t) => sum + t.total, 0);
+    const totalExpenses = filteredExps.reduce((sum, e) => sum + e.amount, 0);
+    const net = totalOmzet - totalExpenses;
+
+    if (document.getElementById('rep-today-count')) document.getElementById('rep-today-count').innerText = validTrxs.length;
+    document.getElementById('rep-omzet').innerText = `Rp${totalOmzet.toLocaleString('id-ID')}`;
+    document.getElementById('rep-expenses').innerText = `Rp${totalExpenses.toLocaleString('id-ID')}`;
+    document.getElementById('rep-net').innerText = `Rp${net.toLocaleString('id-ID')}`;
+    document.getElementById('rep-period').innerText = from || to ? `${from || 'Awal'} s/d ${to || 'Sekarang'}` : 'Semua data';
+    document.getElementById('rep-detail-tbody').innerHTML = [
+        ...validTrxs.map(t => `<tr><td>Penjualan</td><td>${t.id}</td><td>${t.date || '-'}</td><td>${t.customer || 'Guest'}</td><td>Rp${(Number(t.total) || 0).toLocaleString('id-ID')}</td></tr>`),
+        ...filteredExps.map((e, i) => `<tr><td>Pengeluaran</td><td>EXP-${i + 1}</td><td>${e.date || '-'}</td><td>${e.name || e.title || e.category || '-'}</td><td>Rp${(Number(e.amount) || 0).toLocaleString('id-ID')}</td></tr>`)
+    ].join('') || '<tr><td colspan="5" class="text-muted text-center">Tidak ada data pada periode ini.</td></tr>';
+}
+
+function parseReportDate(value) {
+    if (!value) return null;
+    const match = String(value).match(/^(\d{1,2})[\\/-](\d{1,2})[\\/-](\d{4})/);
+    if (match) return new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isReportDateInRange(date, from = document.getElementById('rep-date-from')?.value || '', to = document.getElementById('rep-date-to')?.value || '') {
+    const value = parseReportDate(date);
+    if (!value) return true;
+    const key = value.toISOString().slice(0, 10);
+    return (!from || key >= from) && (!to || key <= to);
+}
+
+function clearReportFilter() {
+    document.getElementById('rep-date-from').value = '';
+    document.getElementById('rep-date-to').value = '';
+    renderReports();
+}
+
+function csvCell(value) {
+    return `"${String(value ?? '').replace(/"/g, '""')}"`;
+}
+
+function exportReportsCSV() {
+    const trxs = (Storage.get('transactions') || []).filter(t => t.status !== 'VOID' && isReportDateInRange(t.date));
+    const exps = (Storage.get('expenses') || []).filter(e => isReportDateInRange(e.date));
+    if (!trxs.length && !exps.length) return showToast('Tidak ada data laporan!');
+
+    const rows = [
+        ['TIPE', 'ID', 'TANGGAL', 'JAM', 'KETERANGAN', 'METODE', 'NOMINAL', 'STATUS'],
+        ...trxs.map(t => ['PENJUALAN', t.id, t.date, t.time, t.customer || '-', t.payMethod || '-', t.total, t.status || 'PAID']),
+        ...exps.map((e, i) => ['PENGELUARAN', `EXP-${i + 1}`, e.date || '-', e.time || '-', e.title || e.name || e.category || '-', '-', e.amount || 0, 'RECORDED'])
+    ];
+    const csv = '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `laporan_${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+}
+
+function exportReportsPDF() {
+    const trxs = (Storage.get('transactions') || []).filter(t => t.status !== 'VOID' && isReportDateInRange(t.date));
+    const exps = (Storage.get('expenses') || []).filter(e => isReportDateInRange(e.date));
+    if (!trxs.length && !exps.length) return showToast('Tidak ada data laporan!');
+
+    const totalOmzet = trxs.reduce((sum, t) => sum + (Number(t.total) || 0), 0);
+    const totalExpenses = exps.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+    const money = value => `Rp${value.toLocaleString('id-ID')}`;
+    const rows = [
+        ...trxs.map(t => `<tr><td>Penjualan</td><td>${t.id}</td><td>${t.date || '-'}</td><td>${t.customer || '-'}</td><td>${money(Number(t.total) || 0)}</td></tr>`),
+        ...exps.map((e, i) => `<tr><td>Pengeluaran</td><td>EXP-${i + 1}</td><td>${e.date || '-'}</td><td>${e.title || e.name || e.category || '-'}</td><td>${money(Number(e.amount) || 0)}</td></tr>`)
+    ].join('');
+    const reportWindow = window.open('', '_blank');
+    if (!reportWindow) return showToast('Izinkan pop-up browser untuk membuat PDF.');
+    reportWindow.document.write(`<!doctype html><html><head><title>Laporan ${new Date().toLocaleDateString('id-ID')}</title>
+        <style>body{font-family:Arial,sans-serif;color:#17231e;padding:24px}h1{margin:0 0 6px}p{color:#66736d}.summary{display:flex;gap:14px;margin:22px 0}.box{border:1px solid #d9e1dc;border-radius:8px;padding:12px;min-width:150px}.box b{display:block;font-size:18px;margin-top:5px}table{width:100%;border-collapse:collapse;margin-top:20px}th,td{border-bottom:1px solid #ddd;text-align:left;padding:9px}th{background:#f1f4f1}@media print{button{display:none}}</style></head><body>
+        <h1>Laporan Ringkasan</h1><p>Dibuat pada ${new Date().toLocaleString('id-ID')}</p>
+        <div class="summary"><div class="box">Total Omzet<b>${money(totalOmzet)}</b></div><div class="box">Total Pengeluaran<b>${money(totalExpenses)}</b></div><div class="box">Bersih (Net)<b>${money(totalOmzet - totalExpenses)}</b></div></div>
+        <table><thead><tr><th>Tipe</th><th>ID</th><th>Tanggal</th><th>Keterangan</th><th>Nominal</th></tr></thead><tbody>${rows}</tbody></table>
+        <script>window.onload=()=>window.print()<\/script></body></html>`);
+    reportWindow.document.close();
+}
+
+function switchSettingsTab(tabName) {
+    document.querySelectorAll('.settings-tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.settings-panel-tab').forEach(p => p.classList.remove('active'));
+
+    const btn = document.querySelector(`.settings-tab-btn[onclick*="${tabName}"]`);
+    if (btn) btn.classList.add('active');
+
+    document.getElementById(`set-tab-${tabName}`).classList.add('active');
+}
+
+function loadSettingsForm() {
+    const settings = Storage.get('settings') || {};
+    document.getElementById('set-cafe-name').value = settings.cafeName || '';
+    document.getElementById('set-cafe-addr').value = settings.address || '';
+    document.getElementById('set-cafe-phone').value = settings.phone || '';
+    document.getElementById('set-cashier-name').value = settings.cashierName || '';
+    document.getElementById('set-tax-rate').value = settings.taxRate || 10;
+    document.getElementById('set-extra-shot-price').value = settings.extraShotPrice ? Number(settings.extraShotPrice).toLocaleString('id-ID') : '5.000';
+    const optionPrices = settings.customOptionPrices || {};
+    document.getElementById('set-less-sugar-price').value = Number(optionPrices.lessSugar || 0).toLocaleString('id-ID');
+    document.getElementById('set-no-sugar-price').value = Number(optionPrices.noSugar || 0).toLocaleString('id-ID');
+    document.getElementById('set-less-ice-price').value = Number(optionPrices.lessIce || 0).toLocaleString('id-ID');
+    document.getElementById('set-no-ice-price').value = Number(optionPrices.noIce || 0).toLocaleString('id-ID');
+    document.getElementById('set-hot-price').value = Number(optionPrices.hot || 0).toLocaleString('id-ID');
+    document.getElementById('set-receipt-footer').value = settings.receiptFooter || '';
+    document.getElementById('set-bank-name').value = settings.bankName || '';
+    document.getElementById('set-bank-no').value = settings.bankNo || '';
+    document.getElementById('set-bank-holder').value = settings.bankHolder || '';
+
+    document.getElementById('set-markup-gofood').value = settings.markupGofood || 20;
+    document.getElementById('set-markup-grabfood').value = settings.markupGrabfood || 20;
+    document.getElementById('set-markup-shopeefood').value = settings.markupShopeefood || 20;
+    document.getElementById('set-delete-pin').value = settings.deleteTransactionPin || '1234';
+    Auth.check().then(user => {
+        const emailInput = document.getElementById('account-email');
+        if (user && emailInput) emailInput.value = user.email;
+    }).catch(() => {});
+
+    tempQrisImage = settings.qrisImage || null;
+    tempLogoImage = settings.logoImage || null;
+
+    renderQrisPreview();
+    renderLogoPreview();
+}
+
+function handleQrisUpload(e) {
+    const file = e.target.files[0];
+    if (file) {
+        const reader = new FileReader();
+        reader.onload = function (evt) {
+            tempQrisImage = evt.target.result;
+            renderQrisPreview();
+        };
+        reader.readAsDataURL(file);
+    }
+}
+
+function renderQrisPreview() {
+    const container = document.getElementById('set-qris-preview');
+    if (tempQrisImage) {
+        container.innerHTML = `<img src="${tempQrisImage}" style="max-width:150px; border-radius:var(--radius-sm); border:1px solid var(--border);">`;
+    } else {
+        container.innerHTML = `<span class="text-muted" style="font-size:0.8rem;">Belum ada gambar QRIS</span>`;
+    }
+}
+
+function handleLogoUpload(e) {
+    const file = e.target.files[0];
+    if (file) {
+        const reader = new FileReader();
+        reader.onload = function (evt) {
+            tempLogoImage = evt.target.result;
+            renderLogoPreview();
+        };
+        reader.readAsDataURL(file);
+    }
+}
+
+function renderLogoPreview() {
+    const container = document.getElementById('set-logo-preview');
+    if (tempLogoImage) {
+        container.innerHTML = `<img src="${tempLogoImage}" style="max-width:80px; height:80px; object-fit:cover; border-radius:var(--radius-sm); border:1px solid var(--border);">`;
+    } else {
+        container.innerHTML = `<span class="text-muted" style="font-size:0.8rem;">Belum ada logo toko</span>`;
+    }
+}
+
+function renderQrisDisplay() {
+    const settings = Storage.get('settings') || {};
+    const box = document.getElementById('qris-display-box');
+    if (settings.qrisImage) {
+        box.innerHTML = `<img src="${settings.qrisImage}" style="max-width:200px; border-radius:var(--radius-sm);">`;
+    } else {
+        box.innerHTML = `<i class="fa-solid fa-qrcode fa-4x text-green"></i>`;
+    }
+}
+
+function saveSettings() {
+    const settings = {
+        cafeName: document.getElementById('set-cafe-name').value.trim(),
+        address: document.getElementById('set-cafe-addr').value.trim(),
+        phone: document.getElementById('set-cafe-phone').value.trim(),
+        cashierName: document.getElementById('set-cashier-name').value.trim() || 'Kasir',
+        taxRate: parseFloat(document.getElementById('set-tax-rate').value) || 0,
+        extraShotPrice: parseInt(document.getElementById('set-extra-shot-price').value.replace(/\D/g, ''), 10) || 0,
+        customOptionPrices: {
+            lessSugar: parseInt(document.getElementById('set-less-sugar-price').value.replace(/\D/g, ''), 10) || 0,
+            noSugar: parseInt(document.getElementById('set-no-sugar-price').value.replace(/\D/g, ''), 10) || 0,
+            lessIce: parseInt(document.getElementById('set-less-ice-price').value.replace(/\D/g, ''), 10) || 0,
+            noIce: parseInt(document.getElementById('set-no-ice-price').value.replace(/\D/g, ''), 10) || 0,
+            hot: parseInt(document.getElementById('set-hot-price').value.replace(/\D/g, ''), 10) || 0
+        },
+        receiptFooter: document.getElementById('set-receipt-footer').value.trim(),
+        bankName: document.getElementById('set-bank-name').value.trim(),
+        bankNo: document.getElementById('set-bank-no').value.trim(),
+        bankHolder: document.getElementById('set-bank-holder').value.trim(),
+        qrisImage: tempQrisImage,
+        logoImage: tempLogoImage,
+        markupGofood: parseFloat(document.getElementById('set-markup-gofood').value) || 0,
+        markupGrabfood: parseFloat(document.getElementById('set-markup-grabfood').value) || 0,
+        markupShopeefood: parseFloat(document.getElementById('set-markup-shopeefood').value) || 0,
+        deleteTransactionPin: document.getElementById('set-delete-pin').value.trim() || '1234'
+    };
+    Storage.set('settings', settings);
+    updateBrandLogoDisplay();
+    showToast('Pengaturan berhasil disimpan');
+}
+
+let pwaIconDraft = null;
+
+function getPwaSettings() {
+    try { return JSON.parse(localStorage.getItem('nexpos_pwa_settings') || '{}'); }
+    catch { return {}; }
+}
+
+function loadPwaSettingsForm() {
+    const config = getPwaSettings();
+    document.getElementById('set-app-name').value = config.name || document.title || 'NexPOS Coffee Studio';
+    document.getElementById('set-app-short-name').value = config.shortName || 'NexPOS';
+    pwaIconDraft = config.icon || 'icon.svg';
+    renderPwaIconPreview();
+}
+
+function handlePwaIconUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = event => { pwaIconDraft = event.target.result; renderPwaIconPreview(); };
+    reader.readAsDataURL(file);
+}
+
+function renderPwaIconPreview() {
+    const preview = document.getElementById('set-app-icon-preview');
+    if (!preview) return;
+    preview.innerHTML = pwaIconDraft
+        ? '<img src="' + pwaIconDraft + '" alt="Preview logo app">'
+        : '<span class="text-muted">Belum ada logo app</span>';
+}
+
+function applyPwaManifest(config) {
+    // Keep manifest.json on a normal HTTP URL. Blob manifests are not installable PWAs.
+    document.title = config.name;
+    document.querySelectorAll('link[rel="icon"], link[rel="apple-touch-icon"]').forEach(link => { link.href = config.icon || 'icon.svg'; });
+}
+
+function savePwaSettings() {
+    const name = document.getElementById('set-app-name').value.trim();
+    const shortName = document.getElementById('set-app-short-name').value.trim();
+    if (!name || !shortName) return showToast('Nama aplikasi dan nama singkat wajib diisi.');
+    const config = { name, shortName, icon: pwaIconDraft || 'icon.svg', updatedAt: new Date().toISOString() };
+    localStorage.setItem('nexpos_pwa_settings', JSON.stringify(config));
+    applyPwaManifest(config);
+    showToast('Pengaturan App berhasil disimpan. Refresh sebelum install ulang.');
+}
+function printReceipt() {
+    const trx = window.lastCompletedTrx;
+    if (!trx) return;
+    fillReceiptArea(trx);
+    window.print();
+}
+
+function testPrintReceipt() {
+    const trx = window.lastCompletedTrx || {
+        id: 'TEST-58MM',
+        date: new Date().toLocaleDateString('id-ID'),
+        time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+        orderType: 'DINE_IN',
+        customer: 'Test Customer',
+        payMethod: 'CASH',
+        items: [{ name: 'Latte Test', qty: 1, price: 18000, customStr: 'Normal • Normal' }],
+        subtotal: 18000,
+        discount: 0,
+        tax: 0,
+        total: 18000,
+        cashPaid: 20000
+    };
+    fillReceiptArea(trx);
+    window.print();
+}
+
+async function connectUsbPrinter() {
+    if (!navigator.serial) return showToast('USB Serial tidak didukung. Gunakan Chrome/Edge desktop.');
+    try {
+        connectedPrinterPort = await navigator.serial.requestPort();
+        await connectedPrinterPort.open({ baudRate: 9600 });
+        document.getElementById('printer-status').innerText = 'Status: Printer USB terhubung';
+        showToast('Printer USB berhasil terhubung.');
+    } catch (error) {
+        showToast('Koneksi USB dibatalkan atau gagal.');
+    }
+}
+
+async function connectBluetoothPrinter() {
+    if (!navigator.bluetooth) return showToast('Bluetooth Web tidak didukung browser ini.');
+    showToast('Bluetooth printer klasik/SPP biasanya membutuhkan aplikasi bridge seperti RawBT.');
+    try {
+        await navigator.bluetooth.requestDevice({ acceptAllDevices: true });
+        document.getElementById('printer-status').innerText = 'Status: Bluetooth terdeteksi (perlu bridge ESC/POS)';
+    } catch (error) {
+        if (error.name !== 'NotFoundError') showToast('Bluetooth tidak dapat diakses.');
+    }
+}
+
+async function testConnectedPrinter() {
+    if (!connectedPrinterPort) return testPrintReceipt();
+    try {
+        const writer = connectedPrinterPort.writable.getWriter();
+        const text = new TextEncoder().encode('\x1b@\nNexPOS Coffee\nTEST PRINT\n\n\x1dV\x00');
+        await writer.write(text);
+        writer.releaseLock();
+        showToast('Test print dikirim ke printer USB.');
+    } catch (error) {
+        showToast('Gagal mengirim test print. Gunakan simulasi PDF.');
+    }
+}
+
+function reprintReceipt(trxId) {
+    const trxs = Storage.get('transactions') || [];
+    const trx = trxs.find(t => t.id === trxId);
+    if (trx) {
+        fillReceiptArea(trx);
+        window.print();
+    }
+}
+
+function fillReceiptArea(trx) {
+    const settings = Storage.get('settings') || {};
+    document.getElementById('rcp-cafe-name').innerText = settings.cafeName || 'NEXPOS COFFEE';
+    document.getElementById('rcp-cafe-addr').innerText = settings.address || '';
+    document.getElementById('rcp-cafe-phone').innerText = settings.phone ? `HP: ${settings.phone}` : '';
+
+    const logoBox = document.getElementById('rcp-logo-box');
+    if (settings.logoImage) {
+        logoBox.innerHTML = `<img src="${settings.logoImage}" style="max-width:60px; height:60px; object-fit:cover;">`;
+    } else {
+        logoBox.innerHTML = '';
+    }
+
+    document.getElementById('rcp-order-num').innerText = trx.id;
+    document.getElementById('rcp-order-type').innerText = trx.orderType;
+    document.getElementById('rcp-date').innerText = `${trx.date} ${trx.time}`;
+    document.getElementById('rcp-cust-label').innerText = ['GOFOOD', 'GRABFOOD', 'SHOPEEFOOD'].includes(trx.orderType) ? 'Driver / No. Order:' : 'Pelanggan:';
+    document.getElementById('rcp-cust').innerText = trx.customer;
+    const configuredCashier = (Storage.get('settings') || {}).cashierName || 'Kasir';
+    const cashierName = trx.cashier && !String(trx.cashier).includes('@') && !['Admin Studio', 'Owner'].includes(trx.cashier)
+        ? trx.cashier : configuredCashier;
+    document.getElementById('rcp-cashier').innerText = cashierName;
+
+    document.getElementById('rcp-items-list').innerHTML = trx.items.map(item => `
+        <div style="margin-bottom:4px;">
+            <div class="receipt-line">
+                <span>${item.qty}x ${item.name}</span>
+                <span>Rp${(item.price * item.qty).toLocaleString('id-ID')}</span>
+            </div>
+            ${item.beanName ? `<div style="font-size:9px; color:#555; padding-left:10px;"><strong>Beans:</strong> ${item.beanName}</div>` : ''}
+            ${item.customStr ? `<div style="font-size:9px; color:#555; padding-left:10px;">${item.customStr}</div>` : ''}
+        </div>
+    `).join('');
+
+    document.getElementById('rcp-note-row').style.display = trx.note ? 'flex' : 'none';
+    document.getElementById('rcp-note').innerText = trx.note || '';
+
+    document.getElementById('rcp-subtotal').innerText = `Rp${trx.subtotal.toLocaleString('id-ID')}`;
+
+    const rcpMarkupRow = document.getElementById('rcp-markup-row');
+    if (trx.markupAmount && trx.markupAmount > 0) {
+        rcpMarkupRow.style.display = 'flex';
+        document.getElementById('rcp-markup').innerText = `+Rp${trx.markupAmount.toLocaleString('id-ID')}`;
+    } else {
+        rcpMarkupRow.style.display = 'none';
+    }
+
+    document.getElementById('rcp-discount').innerText = `-Rp${trx.discount.toLocaleString('id-ID')}`;
+    document.getElementById('rcp-tax').innerText = `Rp${trx.tax.toLocaleString('id-ID')}`;
+    document.getElementById('rcp-total').innerText = `Rp${trx.total.toLocaleString('id-ID')}`;
+    document.getElementById('rcp-method').innerText = trx.payMethod;
+    document.getElementById('rcp-pay-amount').innerText = `Rp${trx.cashPaid.toLocaleString('id-ID')}`;
+    document.getElementById('rcp-change').innerText = `Rp${(trx.cashPaid - trx.total).toLocaleString('id-ID')}`;
+
+    document.getElementById('rcp-footer-msg').innerText = settings.receiptFooter || 'Terima kasih!';
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    Auth.check().then(user => user ? Storage.init().then(renderDashboard) : null).catch(() => {
+        document.body.insertAdjacentHTML('beforeend', '<div class="db-error">Login atau database SQLite belum tersambung. Pastikan server NexPOS sedang berjalan.</div>');
+    });
+});
+
+
+window.addEventListener('DOMContentLoaded', () => { const savedPwaConfig = getPwaSettings(); if (savedPwaConfig.name) applyPwaManifest(savedPwaConfig); });
